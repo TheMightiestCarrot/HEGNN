@@ -1,8 +1,10 @@
 import os
+import sys
 import json
 import time
 import argparse
 from functools import partial
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -60,6 +62,10 @@ parser.add_argument('--sample', type=int, default=3, help='how much to sample')
 parser.add_argument('--log_directory', type=str, default='./logs/nbody', help='directory to generate the json log file (default: ./logs/nbody)')
 parser.add_argument('--test_interval', type=int, default=5, help='how many epochs to wait before logging test (default: 5)')
 
+parser.add_argument('--wandb', action='store_true', help='enable Weights & Biases logging')
+parser.add_argument('--wandb_project', type=str, default='HEGNN', help='Weights & Biases project name')
+parser.add_argument('--wandb_run_name', type=str, default=None, help='Weights & Biases run name override')
+parser.add_argument('--wandb_entity', type=str, default=None, help='Weights & Biases entity (team/user)')
 
 # Fast EGNN
 parser.add_argument('--cutoff_rate', type=float, default=0, help='cutoff rate of edge_rr')
@@ -89,6 +95,27 @@ def count_parameters(model):
 
 if __name__ == '__main__':
     log_time_suffix = str(time.strftime('%Y-%m-%d_%H-%M-%S',time.localtime(time.time())))
+
+    wandb_run = None
+    if args.wandb:
+        try:
+            import importlib
+            import site
+
+            venv_site = Path(__file__).resolve().parent / '.venv' / 'lib' / f'python{sys.version_info.major}.{sys.version_info.minor}' / 'site-packages'
+            if venv_site.is_dir():
+                site.addsitedir(str(venv_site))
+
+            if 'wandb' in sys.modules and getattr(sys.modules['wandb'], '__file__', None) is None:
+                sys.modules.pop('wandb')
+
+            wandb = importlib.import_module('wandb')
+        except ImportError as err:
+            raise ImportError("wandb is not installed. Install it with `pip install wandb` or disable --wandb.") from err
+        wandb_run = wandb.init(project=args.wandb_project,
+                               name=args.wandb_run_name,
+                               entity=args.wandb_entity,
+                               config=vars(args))
 
     dataset = partial(NBodySystemDataset, dataset_name=args.dataset_name, data_dir=args.data_directory, 
                       cutoff_rate=args.cutoff_rate, virtual_channels=args.virtual_channel, device=args.device)
@@ -154,4 +181,8 @@ if __name__ == '__main__':
 
     best_log_dict, log_dict = train(model, loader_train, loader_valid, loader_test, optimizer, loss_mse, sigma=args.sigma,
                                     weight=args.weight, device=args.device, test_interval=args.test_interval, config=args,
-                                    log_directory=log_directory, log_name=log_name, early_stop=args.early_stop, sample=args.sample)
+                                    log_directory=log_directory, log_name=log_name, early_stop=args.early_stop, sample=args.sample,
+                                    wandb_run=wandb_run)
+
+    if wandb_run is not None:
+        wandb_run.finish()

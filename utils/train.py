@@ -5,6 +5,8 @@ import csv
 
 import torch
 
+METRIC_TARGET_FLOOR = 1e-3
+
 def get_edges_in_mini_batch(batch_size, num_nodes_all, edge_index):
     correction_for_batch = num_nodes_all * torch.arange(batch_size, device=edge_index.device)  # [batch_size]
     correction_for_batch = correction_for_batch.repeat_interleave(edge_index.size(1) // batch_size, dim=0).unsqueeze(0)  # [1, edge_cnt]
@@ -25,7 +27,7 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
     else:
         model.eval()
 
-    result = {'loss': 0., 'counter': 0.}
+    result = {'loss': 0., 'counter': 0., 'pos_err': 0.}
     for batch_index, data in enumerate(loader):
         # All to device
         data = data.to(device)
@@ -93,10 +95,27 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
             raise Exception('Wrong model')
         
         loss_loc = loss(loc_predict, loc_t)
+        with torch.no_grad():
+            loc_t_detached = loc_t.detach()
+            err = (loc_predict - loc_t_detached).detach()
+            err_l2 = torch.linalg.norm(err, dim=1)
+            target_norm = torch.linalg.norm(loc_t_detached, dim=1)
+            rms = torch.sqrt(torch.mean(loc_t_detached.pow(2)))
+            floor = torch.maximum(
+                rms,
+                torch.tensor(
+                    METRIC_TARGET_FLOOR,
+                    device=target_norm.device,
+                    dtype=target_norm.dtype
+                ),
+            )
+            denom = torch.clamp(target_norm, min=floor)
+            pct_err = (err_l2 / denom).mean().item() * 100.0
 
         # record the loss
         result['loss'] += loss_loc.item() * batch_size
         result['counter'] += batch_size
+        result['pos_err'] += pct_err * batch_size
         
         if backprop:
             loss_loc.backward()
@@ -108,28 +127,61 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
     else:
         prefix = ""
 
-    print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {result["loss"] / result["counter"] :.5f}')
+    if result['counter'] == 0:
+        print(f'{prefix + tag} epoch: {epoch_index}, no batches processed (batch_size too large?).')
+        return 0.0, 0.0
 
-    return result['loss'] / result['counter']
+    avg_loss = result["loss"] / result["counter"]
+    avg_pos_err = result["pos_err"] / result["counter"]
+    print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}')
 
-def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma, weight, log_directory, log_name, early_stop=float('inf'), device='cpu', test_interval=5, sample=3, config=None):
-    log_dict = {'epochs': [], 'loss': [], 'loss_train': []}
-    best_log_dict = {'epoch_index': 0, 'loss_valid': 1e8, 'loss_test': 1e8, 'loss_train': 1e8}
+    return avg_loss, avg_pos_err
+
+def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma, weight, log_directory, log_name,
+          early_stop=float('inf'), device='cpu', test_interval=5, sample=3, config=None, wandb_run=None):
+    log_dict = {'epochs': [], 'loss': [], 'loss_train': [], 'pos_err': [], 'pos_err_train': []}
+    best_log_dict = {'epoch_index': 0, 'loss_valid': 1e8, 'loss_test': 1e8, 'loss_train': 1e8,
+                     'pos_err_valid': 1e8, 'pos_err_test': 1e8, 'pos_err_train': 1e8}
 
     start =time.perf_counter()
     for epoch_index in range(1, 2500+1):
-        loss_train = train_single_epoch(model, loader_train, optimizer, loss, sigma, weight, epoch_index, backprop=True, tag='train', device=device, sample=sample)
+        loss_train, pos_err_train = train_single_epoch(model, loader_train, optimizer, loss, sigma, weight, epoch_index, backprop=True, tag='train', device=device, sample=sample)
         log_dict['loss_train'].append(loss_train)
+        log_dict['pos_err_train'].append(pos_err_train)
+        if wandb_run is not None:
+            wandb_run.log({
+                'epoch': epoch_index,
+                'train/step': epoch_index,
+                'train/loss': loss_train,
+                'train/pos_perc_error': pos_err_train
+            }, step=epoch_index)
 
         if epoch_index % test_interval == 0:
-            loss_valid = train_single_epoch(model, loader_valid, optimizer, loss, sigma, weight, epoch_index, backprop=False, tag='valid', device=device, sample=sample)
-            loss_test = train_single_epoch(model, loader_test, optimizer, loss, sigma, weight, epoch_index, backprop=False, tag='test', device=device, sample=sample)
+            loss_valid, pos_err_valid = train_single_epoch(model, loader_valid, optimizer, loss, sigma, weight, epoch_index, backprop=False, tag='valid', device=device, sample=sample)
+            loss_test, pos_err_test = train_single_epoch(model, loader_test, optimizer, loss, sigma, weight, epoch_index, backprop=False, tag='test', device=device, sample=sample)
             
             log_dict['epochs'].append(epoch_index)
             log_dict['loss'].append(loss_test)
+            log_dict['pos_err'].append(pos_err_test)
+            if wandb_run is not None:
+                wandb_run.log({
+                    'epoch': epoch_index,
+                    'valid/step': epoch_index,
+                    'valid/loss': loss_valid,
+                    'valid/pos_perc_error': pos_err_valid,
+                    'test/step': epoch_index,
+                    'test/loss': loss_test,
+                    'test/pos_perc_error': pos_err_test
+                }, step=epoch_index)
             
             if loss_valid < best_log_dict['loss_valid']:
-                best_log_dict = {'epoch_index': epoch_index, 'loss_valid': loss_valid, 'loss_test': loss_test, 'loss_train': loss_train}
+                best_log_dict = {'epoch_index': epoch_index,
+                                 'loss_valid': loss_valid,
+                                 'loss_test': loss_test,
+                                 'loss_train': loss_train,
+                                 'pos_err_valid': pos_err_valid,
+                                 'pos_err_test': pos_err_test,
+                                 'pos_err_train': pos_err_train}
                 name = None
                 if config.dataset_name in ['5_0_0', '20_0_0', '50_0_0', '100_0_0']:
                     name = 'nbody'
