@@ -1,0 +1,21 @@
+services:
+  hegnn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hegnn-dev:latest
+    container_name: hegnn-dev
+    working_dir: /workspace
+    user: "1000:1000"
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./:/workspace
+    env_file:
+      - .env
+    environment:
+      - WANDB_DIR=/workspace/logs/wandb
+      - NVIDIA_VISIBLE_DEVICES=all
+    # Uncomment to enable GPU access (requires NVIDIA Container Toolkit)
+    gpus: all
+      

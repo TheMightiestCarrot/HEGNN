@@ -133,4 +133,6 @@ dmypy.json
 .pyre/
 datasets/nbody/data_5body_full/
 datasets/nbody/data_small/
+data/
 logs/
+state_dict/
