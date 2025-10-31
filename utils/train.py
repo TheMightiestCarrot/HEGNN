@@ -21,7 +21,8 @@ def kernel(x, y, sigma):
     return k
 
 
-def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_index, backprop, tag, sample, device='cpu'):
+def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_index, backprop, tag, sample, device='cpu',
+                      scheduler=None, scheduler_mode='none'):
     if backprop:
         model.train()
     else:
@@ -121,6 +122,11 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
             loss_loc.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
             optimizer.step()
+            if scheduler is not None and scheduler_mode == 'batch':
+                try:
+                    scheduler.step()
+                except Exception as e:
+                    print(f'[warn] batch scheduler.step() failed: {e}')
 
     if not backprop:
         prefix = "==> "
@@ -138,14 +144,25 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
     return avg_loss, avg_pos_err
 
 def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma, weight, log_directory, log_name,
-          early_stop=float('inf'), device='cpu', test_interval=5, sample=3, config=None, wandb_run=None):
+          early_stop=float('inf'), device='cpu', test_interval=5, sample=3, config=None, wandb_run=None,
+          scheduler=None, scheduler_mode='none'):
     log_dict = {'epochs': [], 'loss': [], 'loss_train': [], 'pos_err': [], 'pos_err_train': []}
     best_log_dict = {'epoch_index': 0, 'loss_valid': 1e8, 'loss_test': 1e8, 'loss_train': 1e8,
                      'pos_err_valid': 1e8, 'pos_err_test': 1e8, 'pos_err_train': 1e8}
 
     start =time.perf_counter()
-    for epoch_index in range(1, 2500+1):
-        loss_train, pos_err_train = train_single_epoch(model, loader_train, optimizer, loss, sigma, weight, epoch_index, backprop=True, tag='train', device=device, sample=sample)
+    max_epochs = 2500
+    try:
+        if config is not None and hasattr(config, 'epochs'):
+            max_epochs = int(getattr(config, 'epochs'))
+    except Exception:
+        max_epochs = 2500
+    for epoch_index in range(1, max_epochs+1):
+        loss_train, pos_err_train = train_single_epoch(
+            model, loader_train, optimizer, loss, sigma, weight, epoch_index,
+            backprop=True, tag='train', device=device, sample=sample,
+            scheduler=scheduler, scheduler_mode=scheduler_mode
+        )
         log_dict['loss_train'].append(loss_train)
         log_dict['pos_err_train'].append(pos_err_train)
         if wandb_run is not None:
@@ -153,12 +170,19 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                 'epoch': epoch_index,
                 'train/step': epoch_index,
                 'train/loss': loss_train,
-                'train/pos_perc_error': pos_err_train
+                'train/pos_perc_error': pos_err_train,
+                'lr': optimizer.param_groups[0]['lr']
             }, step=epoch_index)
 
         if epoch_index % test_interval == 0:
-            loss_valid, pos_err_valid = train_single_epoch(model, loader_valid, optimizer, loss, sigma, weight, epoch_index, backprop=False, tag='valid', device=device, sample=sample)
-            loss_test, pos_err_test = train_single_epoch(model, loader_test, optimizer, loss, sigma, weight, epoch_index, backprop=False, tag='test', device=device, sample=sample)
+            loss_valid, pos_err_valid = train_single_epoch(
+                model, loader_valid, optimizer, loss, sigma, weight, epoch_index,
+                backprop=False, tag='valid', device=device, sample=sample
+            )
+            loss_test, pos_err_test = train_single_epoch(
+                model, loader_test, optimizer, loss, sigma, weight, epoch_index,
+                backprop=False, tag='test', device=device, sample=sample
+            )
             
             log_dict['epochs'].append(epoch_index)
             log_dict['loss'].append(loss_test)
@@ -171,8 +195,16 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                     'valid/pos_perc_error': pos_err_valid,
                     'test/step': epoch_index,
                     'test/loss': loss_test,
-                    'test/pos_perc_error': pos_err_test
+                    'test/pos_perc_error': pos_err_test,
+                    'lr': optimizer.param_groups[0]['lr']
                 }, step=epoch_index)
+
+            # Plateau scheduler uses validation loss; step here when we have it
+            if scheduler is not None and scheduler_mode == 'plateau':
+                try:
+                    scheduler.step(loss_valid)
+                except Exception as e:
+                    print(f'[warn] plateau scheduler.step(loss) failed: {e}')
             
             if loss_valid < best_log_dict['loss_valid']:
                 best_log_dict = {'epoch_index': epoch_index,
@@ -194,6 +226,13 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                 best_log_dict['early_stop'] = epoch_index
                 print(f'Early stopped! Epoch: {epoch_index}')
                 break
+
+        # Step epoch-based schedulers every epoch
+        if scheduler is not None and scheduler_mode == 'epoch':
+            try:
+                scheduler.step()
+            except Exception as e:
+                print(f'[warn] epoch scheduler.step() failed: {e}')
 
         end = time.perf_counter() 
         time_cost = end - start

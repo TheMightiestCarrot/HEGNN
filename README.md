@@ -48,6 +48,63 @@ python -u ./datasets/nbody/datagen/generate_dataset.py --num-train 5000 --seed 4
 python ./main_nbody.py --model HEGNN --ell 3 --data_directory <your_dir> --dataset_name "5_0_0"
 ```
 
+#### Learning Rate, Schedulers, and LR Finder
+
+The N-body runner now supports configurable learning-rate schedulers and an LR range test.
+
+- Default optimizer: Adam with `--learning_rate` (default `5e-4`) and `--weight_decay` (default `1e-12`).
+- Default scheduler: none (fixed LR). Select via `--scheduler`.
+
+Available schedulers (via `--scheduler`):
+
+- `none` (default): no scheduling.
+- `plateau`: `ReduceLROnPlateau` stepped on validation loss.
+  - `--lr_patience` (default `25`), `--lr_factor` (default `0.5`), `--lr_cooldown` (default `0`), `--lr_min` (default `1e-6`).
+- `cosine`: `CosineAnnealingLR`.
+  - `--lr_t_max` (default `200`), `--lr_min` (default `1e-6`).
+- `cosine_restart`: `CosineAnnealingWarmRestarts`.
+  - `--lr_T_0` (default `200`), `--lr_T_mult` (default `2`), `--lr_min` (default `1e-6`).
+- `step`: `StepLR`.
+  - `--lr_step_size` (default `50`), `--lr_gamma` (default `0.9`).
+- `exponential`: `ExponentialLR`.
+  - `--lr_gamma` (default `0.9`).
+- `warmup_cosine`: linear warmup (`LinearLR`) then cosine.
+  - `--warmup_steps` (default `0`), `--warmup_start_factor` (default `0.1`), plus cosine args above.
+- `onecycle`: `OneCycleLR` (per-batch stepping; uses `--epochs` and loader length).
+  - `--onecycle_pct_start` (default `0.3`), `--onecycle_div_factor` (default `25.0`), `--onecycle_final_div_factor` (default `1e4`).
+
+Examples:
+
+```bash
+# Fixed LR (baseline)
+python -u ./main_nbody.py --model HEGNN --ell 1 --data_directory <your_dir> \
+  --dataset_name 5_0_0 --device cuda --scheduler none
+
+# ReduceLROnPlateau on validation loss
+python -u ./main_nbody.py --model HEGNN --ell 1 --data_directory <your_dir> \
+  --dataset_name 5_0_0 --device cuda --scheduler plateau \
+  --lr_patience 25 --lr_factor 0.5 --lr_min 1e-6
+
+# Warmup + Cosine Annealing (T_max ~ total epochs - warmup)
+python -u ./main_nbody.py --model HEGNN --ell 1 --data_directory <your_dir> \
+  --dataset_name 5_0_0 --device cuda --scheduler warmup_cosine \
+  --warmup_steps 50 --lr_t_max 950 --lr_min 1e-6 --epochs 1000
+
+# OneCycleLR (per-batch schedule)
+python -u ./main_nbody.py --model HEGNN --ell 1 --data_directory <your_dir> \
+  --dataset_name 5_0_0 --device cuda --scheduler onecycle --epochs 300
+```
+
+LR Finder (range test):
+
+```bash
+python -u ./main_nbody.py --model HEGNN --ell 1 --data_directory <your_dir> \
+  --dataset_name 5_0_0 --device cuda --lr_find --lr_find_steps 200 \
+  --lr_find_min 1e-6 --lr_find_max 5e-2 --max_train_samples 512 --max_test_samples 512
+```
+
+The LR finder sweeps the learning rate, prints a suggested base LR, and saves a CSV curve to `./logs/nbody/lr_finder_<timestamp>.csv`.
+
 ### MD17 Dataset
 
 #### Data Preparation

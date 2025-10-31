@@ -13,6 +13,7 @@ from torch_geometric.loader import DataLoader
 import e3nn
 
 from utils.seed import fix_seed
+from utils.scheduler import build_scheduler, lr_range_test
 from utils.train import train
 from models.GVP import GVPNet
 from models.SchNet import SchNet
@@ -56,6 +57,29 @@ parser.add_argument('--weight_decay', type=float, default=1e-12, help='weight de
 parser.add_argument('--times', type=int, default=1, help='experiment repeat times (default: 1)')
 parser.add_argument('--early_stop', type=int, default=100, help='early stop (default: 100)')
 parser.add_argument('--sample', type=int, default=3, help='how much to sample')
+
+# Scheduler
+parser.add_argument('--scheduler', type=str, default='none',
+                    choices=['none', 'plateau', 'cosine', 'cosine_restart', 'step', 'exponential', 'warmup_cosine', 'onecycle'],
+                    help='LR scheduler type (default: none)')
+parser.add_argument('--lr_min', type=float, default=1e-6, help='Minimum LR for cosine-like schedulers (default: 1e-6)')
+parser.add_argument('--lr_patience', type=int, default=25, help='Patience for ReduceLROnPlateau (default: 25)')
+parser.add_argument('--lr_factor', type=float, default=0.5, help='Factor for ReduceLROnPlateau/Step (default: 0.5)')
+parser.add_argument('--lr_cooldown', type=int, default=0, help='Cooldown for ReduceLROnPlateau (default: 0)')
+parser.add_argument('--lr_step_size', type=int, default=50, help='Step size for StepLR (default: 50)')
+parser.add_argument('--lr_gamma', type=float, default=0.9, help='Gamma for ExponentialLR/StepLR (default: 0.9)')
+parser.add_argument('--lr_t_max', type=int, default=200, help='T_max for CosineAnnealingLR (default: 200)')
+parser.add_argument('--lr_T_0', type=int, default=200, help='T_0 for CosineAnnealingWarmRestarts (default: 200)')
+parser.add_argument('--lr_T_mult', type=int, default=2, help='T_mult for CosineAnnealingWarmRestarts (default: 2)')
+parser.add_argument('--warmup_steps', type=int, default=0, help='Warmup steps for warmup_cosine/onecycle (default: 0)')
+parser.add_argument('--warmup_start_factor', type=float, default=0.1, help='Start factor for LinearLR warmup (default: 0.1)')
+parser.add_argument('--onecycle_pct_start', type=float, default=0.3, help='OneCycleLR pct_start (default: 0.3)')
+parser.add_argument('--onecycle_div_factor', type=float, default=25.0, help='OneCycleLR div_factor (default: 25.0)')
+parser.add_argument('--onecycle_final_div_factor', type=float, default=1e4, help='OneCycleLR final_div_factor (default: 1e4)')
+parser.add_argument('--lr_find', action='store_true', help='Run LR range test instead of full training')
+parser.add_argument('--lr_find_steps', type=int, default=200, help='Number of iterations for LR finder (default: 200)')
+parser.add_argument('--lr_find_min', type=float, default=1e-6, help='Min LR for LR finder (default: 1e-6)')
+parser.add_argument('--lr_find_max', type=float, default=1.0, help='Max LR for LR finder (default: 1.0)')
 
 
 # Log
@@ -135,6 +159,9 @@ if __name__ == '__main__':
         model = EGNN(n_layers=args.num_layer, in_node_nf=2, in_edge_nf=2, hidden_nf=args.dim_hidden, device=args.device, with_v=True)
     elif args.model == 'HEGNN':
         model = HEGNN(num_layer=args.num_layer, node_input_dim=2, edge_attr_dim=2, hidden_dim=args.dim_hidden, max_ell=args.ell, device=args.device)
+    elif args.model == 'HEGNN_noupdate':
+        from models.HEGNN_noupdate import HEGNN as HEGNN_NoUpdate
+        model = HEGNN_NoUpdate(num_layer=args.num_layer, node_input_dim=2, edge_attr_dim=2, hidden_dim=args.dim_hidden, max_ell=args.ell, device=args.device)
     elif args.model == 'GNN':
         model = GNN(n_layers=args.num_layer, in_node_nf=6, in_edge_nf=2, hidden_nf=args.dim_hidden, device=args.device)
     elif args.model == 'Linear':
@@ -176,13 +203,32 @@ if __name__ == '__main__':
     loss_mse = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
+
     log_directory = args.log_directory
     log_name = f'{args.exp_name}_loss_{log_time_suffix}.json'
+
+    # LR finder path (quick diagnostic)
+    if args.lr_find:
+        _ = lr_range_test(
+            model=model,
+            optimizer=optimizer,
+            loss_fn=loss_mse,
+            loader_train=loader_train,
+            device=args.device,
+            start_lr=args.lr_find_min,
+            end_lr=args.lr_find_max,
+            num_steps=int(args.lr_find_steps),
+            log_directory=log_directory,
+            log_time_suffix=log_time_suffix,
+        )
+        sys.exit(0)
+
+    scheduler, scheduler_mode = build_scheduler(optimizer, args, len(loader_train))
 
     best_log_dict, log_dict = train(model, loader_train, loader_valid, loader_test, optimizer, loss_mse, sigma=args.sigma,
                                     weight=args.weight, device=args.device, test_interval=args.test_interval, config=args,
                                     log_directory=log_directory, log_name=log_name, early_stop=args.early_stop, sample=args.sample,
-                                    wandb_run=wandb_run)
+                                    wandb_run=wandb_run, scheduler=scheduler, scheduler_mode=scheduler_mode)
 
     if wandb_run is not None:
         wandb_run.finish()
