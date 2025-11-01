@@ -27,6 +27,17 @@ from datasets.nbody.dataset import NBodySystemDataset
 
 parser=argparse.ArgumentParser(description='HEGNN')
 
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    value = str(v).strip().lower()
+    if value in {"true", "t", "yes", "y", "1"}:
+        return True
+    if value in {"false", "f", "no", "n", "0"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'.")
+
 # Model
 parser.add_argument('--exp_name', type=str, default='simple-exp', help='str type, name of the experiment (default: simple_exp)')
 parser.add_argument('--model', type=str, default='HEGNN', help='which model (default: HEGNN)')
@@ -62,6 +73,8 @@ parser.add_argument('--integrator', type=str, default='symplectic_euler',
                     help='coarse integrator to apply when model supports accelerations (default: symplectic_euler)')
 parser.add_argument('--coarse_dt', type=float, default=1.0,
                     help='coarse timestep ΔT for the integrator (default: 1.0)')
+parser.add_argument('--use_velocity_features', type=str2bool, nargs='?', const=True, default=False,
+                    help='set True to feed symmetric velocity invariants into HEGNN_acceleration force head (default: False)')
 
 # Scheduler
 parser.add_argument('--scheduler', type=str, default='none',
@@ -173,6 +186,7 @@ if __name__ == '__main__':
             hidden_dim=args.dim_hidden,
             max_ell=args.ell,
             device=args.device,
+            use_velocity_features=args.use_velocity_features,
         )
     elif args.model == 'HEGNN_noupdate':
         from models.HEGNN_noupdate import HEGNN as HEGNN_NoUpdate

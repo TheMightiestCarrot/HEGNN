@@ -221,10 +221,12 @@ class HEGNN(nn.Module):
         device: str = "cpu",
         force_activation: Optional[nn.Module] = None,
         distance_eps: float = 1e-8,
+        use_velocity_features: bool = False,
     ) -> None:
         super().__init__()
         self.num_layer = num_layer
         self.distance_eps = distance_eps
+        self.use_velocity_features = use_velocity_features
 
         self.embedding = nn.Linear(node_input_dim, hidden_dim)
         self.sh_init = SH_INIT(edge_attr_dim, hidden_dim, max_ell, activation)
@@ -235,8 +237,14 @@ class HEGNN(nn.Module):
         )
 
         self.force_sh_msg = SH_Msg(self.sh_init.sh_irreps)
+        extra_vel_dims = 5 if self.use_velocity_features else 0
         self.force_mlp = BaseMLP(
-            input_dim=2 * hidden_dim + edge_attr_dim + 1 + self.sh_init.sh_irreps.lmax + 1,
+            input_dim=2 * hidden_dim
+            + edge_attr_dim
+            + 1
+            + self.sh_init.sh_irreps.lmax
+            + 1
+            + extra_vel_dims,
             hidden_dim=hidden_dim,
             output_dim=1,
             activation=activation,
@@ -249,14 +257,20 @@ class HEGNN(nn.Module):
         self,
         node_feat: torch.Tensor,
         node_pos: torch.Tensor,
-        node_vel: torch.Tensor,
+        node_vel: Optional[torch.Tensor],
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         masses: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Alias for predict_acceleration to keep old call-sites working."""
-        del node_vel  # velocities are currently not consumed inside the encoder
-        return self.predict_acceleration(node_feat, node_pos, edge_index, edge_attr, masses)
+        return self.predict_acceleration(
+            node_feat,
+            node_pos,
+            edge_index,
+            edge_attr,
+            masses,
+            node_vel=node_vel,
+        )
 
     def predict_acceleration(
         self,
@@ -265,7 +279,20 @@ class HEGNN(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         masses: Optional[torch.Tensor] = None,
+        node_vel: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_velocity_features and node_vel is None:
+            raise ValueError("node_vel must be provided when use_velocity_features is True")
+
+        if node_vel is not None and node_vel.shape != node_pos.shape:
+            raise ValueError("node_vel must have the same shape as node_pos")
+
+        edge_index, edge_attr = self._ensure_bidirectional_edges(
+            edge_index,
+            edge_attr,
+            num_nodes=node_pos.size(0),
+        )
+
         node_feat_latent, node_sh = self._encode(node_feat, node_pos, edge_index, edge_attr)
         return self._compute_acceleration(
             node_feat_latent,
@@ -274,6 +301,7 @@ class HEGNN(nn.Module):
             edge_index,
             edge_attr,
             masses=masses,
+            node_vel=node_vel,
         )
 
     def symplectic_euler_step(
@@ -287,7 +315,14 @@ class HEGNN(nn.Module):
         dt: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Single symplectic Euler step using the predicted accelerations."""
-        accel = self.predict_acceleration(node_feat, node_pos, edge_index, edge_attr, masses)
+        accel = self.predict_acceleration(
+            node_feat,
+            node_pos,
+            edge_index,
+            edge_attr,
+            masses,
+            node_vel=node_vel,
+        )
         vel_next = node_vel + dt * accel
         pos_next = node_pos + dt * vel_next
         return pos_next, vel_next, accel
@@ -303,11 +338,25 @@ class HEGNN(nn.Module):
         dt: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Single Velocity Verlet step with two acceleration evaluations."""
-        accel_start = self.predict_acceleration(node_feat, node_pos, edge_index, edge_attr, masses)
+        accel_start = self.predict_acceleration(
+            node_feat,
+            node_pos,
+            edge_index,
+            edge_attr,
+            masses,
+            node_vel=node_vel,
+        )
         vel_half = node_vel + 0.5 * dt * accel_start
         pos_next = node_pos + dt * vel_half
 
-        accel_end = self.predict_acceleration(node_feat, pos_next, edge_index, edge_attr, masses)
+        accel_end = self.predict_acceleration(
+            node_feat,
+            pos_next,
+            edge_index,
+            edge_attr,
+            masses,
+            node_vel=vel_half,
+        )
         vel_next = vel_half + 0.5 * dt * accel_end
         return pos_next, vel_next, accel_end
 
@@ -338,9 +387,15 @@ class HEGNN(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
         masses: Optional[torch.Tensor],
+        node_vel: Optional[torch.Tensor],
     ) -> torch.Tensor:
         sym_feat, r_hat, row = self._build_symmetric_edge_features(
-            node_feat, node_pos, node_sh, edge_index, edge_attr
+            node_feat,
+            node_pos,
+            node_sh,
+            edge_index,
+            edge_attr,
+            node_vel=node_vel,
         )
         force_mag = self.force_mlp(sym_feat)
         force_mag = self.force_activation(force_mag)
@@ -360,6 +415,7 @@ class HEGNN(nn.Module):
         node_sh: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        node_vel: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         row, col = edge_index
         rel_vec = node_pos[row] - node_pos[col]
@@ -375,6 +431,43 @@ class HEGNN(nn.Module):
         if edge_attr is not None:
             inputs.append(edge_attr)
         inputs.extend([dist, sh_ip])
+        if self.use_velocity_features:
+            if node_vel is None:
+                raise ValueError("node_vel must be provided when use_velocity_features is True")
+            vi = node_vel[row]
+            vj = node_vel[col]
+            v_rel = vi - vj
+            speed_i2 = (vi * vi).sum(dim=-1, keepdim=True)
+            speed_j2 = (vj * vj).sum(dim=-1, keepdim=True)
+            vdot = (vi * vj).sum(dim=-1, keepdim=True)
+            v_rel_par = (v_rel * r_hat).sum(dim=-1, keepdim=True)
+            v_rel2 = (v_rel * v_rel).sum(dim=-1, keepdim=True)
+            inputs.extend([speed_i2, speed_j2, vdot, v_rel_par, v_rel2])
         sym_feat = torch.cat(inputs, dim=-1)
 
         return sym_feat, r_hat, row
+
+    @staticmethod
+    def _ensure_bidirectional_edges(
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor],
+        num_nodes: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if edge_index.numel() == 0:
+            return edge_index, edge_attr
+
+        row, col = edge_index
+        edge_hash = row * num_nodes + col
+        reverse_hash = col * num_nodes + row
+        missing_mask = ~torch.isin(reverse_hash, edge_hash, assume_unique=False)
+
+        if not torch.any(missing_mask):
+            return edge_index, edge_attr
+
+        add_edge_index = torch.stack([col[missing_mask], row[missing_mask]], dim=0)
+        edge_index = torch.cat([edge_index, add_edge_index], dim=1)
+
+        if edge_attr is not None:
+            edge_attr = torch.cat([edge_attr, edge_attr[missing_mask]], dim=0)
+
+        return edge_index, edge_attr
