@@ -14,7 +14,7 @@ Common symmetric graphs. Equivariant GNNs on symmetric graphs will degenerate to
 ```
 dgl==1.1.3+cu118
 e3nn==0.5.1
-matplotlib==3.7.2
+matplotlib>=3.8,<3.9
 numpy==1.26.4
 scipy==1.8.1
 sympy==1.12
@@ -47,6 +47,23 @@ python -u ./datasets/nbody/datagen/generate_dataset.py --num-train 5000 --seed 4
 ```bash
 python ./main_nbody.py --model HEGNN --ell 3 --data_directory <your_dir> --dataset_name "5_0_0"
 ```
+
+#### Visualise Trajectories
+
+Once the dataset is generated (or you use the bundled samples in `datasets/nbody/data_small`), you can inspect any simulated rollout and export an MP4 animation:
+
+```bash
+pip install -r requirements.txt  # ensures matplotlib is available
+
+# Save simulation 0 from the validation split to an MP4 with short trails and body labels
+python3 visualize_nbody.py --partition valid --simulation-index 0 \
+  --trail-length 5 --annotate --fps 15
+
+# Preview interactively without writing an MP4
+python3 visualize_nbody.py --show
+```
+
+Use `--dataset-root` / `--dataset-name` to point at other generated directories, `--start-frame` / `--end-frame` to trim the playback window, and `--elev` / `--azim` to tune the 3D camera. MP4 export requires `ffmpeg` to be installed and visible on your `PATH`; if it is missing the script will warn and skip the save step.
 
 #### Learning Rate, Schedulers, and LR Finder
 

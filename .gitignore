@@ -131,8 +131,8 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
-datasets/nbody/data_5body_full/
-datasets/nbody/data_small/
+datasets/nbody/data_*/
+datasets/nbody/data_*/
 data/
 logs/
 state_dict/

@@ -57,6 +57,11 @@ parser.add_argument('--weight_decay', type=float, default=1e-12, help='weight de
 parser.add_argument('--times', type=int, default=1, help='experiment repeat times (default: 1)')
 parser.add_argument('--early_stop', type=int, default=100, help='early stop (default: 100)')
 parser.add_argument('--sample', type=int, default=3, help='how much to sample')
+parser.add_argument('--integrator', type=str, default='symplectic_euler',
+                    choices=['symplectic_euler', 'velocity_verlet', 'none'],
+                    help='coarse integrator to apply when model supports accelerations (default: symplectic_euler)')
+parser.add_argument('--coarse_dt', type=float, default=1.0,
+                    help='coarse timestep ΔT for the integrator (default: 1.0)')
 
 # Scheduler
 parser.add_argument('--scheduler', type=str, default='none',
@@ -159,6 +164,16 @@ if __name__ == '__main__':
         model = EGNN(n_layers=args.num_layer, in_node_nf=2, in_edge_nf=2, hidden_nf=args.dim_hidden, device=args.device, with_v=True)
     elif args.model == 'HEGNN':
         model = HEGNN(num_layer=args.num_layer, node_input_dim=2, edge_attr_dim=2, hidden_dim=args.dim_hidden, max_ell=args.ell, device=args.device)
+    elif args.model in ['HEGNN_acceleration', 'HEGNN_acc']:
+        from models.HEGNN_acceleration import HEGNN as HEGNNAcceleration
+        model = HEGNNAcceleration(
+            num_layer=args.num_layer,
+            node_input_dim=2,
+            edge_attr_dim=2,
+            hidden_dim=args.dim_hidden,
+            max_ell=args.ell,
+            device=args.device,
+        )
     elif args.model == 'HEGNN_noupdate':
         from models.HEGNN_noupdate import HEGNN as HEGNN_NoUpdate
         model = HEGNN_NoUpdate(num_layer=args.num_layer, node_input_dim=2, edge_attr_dim=2, hidden_dim=args.dim_hidden, max_ell=args.ell, device=args.device)
@@ -225,10 +240,13 @@ if __name__ == '__main__':
 
     scheduler, scheduler_mode = build_scheduler(optimizer, args, len(loader_train))
 
+    integrator_choice = None if args.integrator == 'none' else args.integrator
+
     best_log_dict, log_dict = train(model, loader_train, loader_valid, loader_test, optimizer, loss_mse, sigma=args.sigma,
                                     weight=args.weight, device=args.device, test_interval=args.test_interval, config=args,
                                     log_directory=log_directory, log_name=log_name, early_stop=args.early_stop, sample=args.sample,
-                                    wandb_run=wandb_run, scheduler=scheduler, scheduler_mode=scheduler_mode)
+                                    wandb_run=wandb_run, scheduler=scheduler, scheduler_mode=scheduler_mode,
+                                    integrator=integrator_choice, integrator_dt=args.coarse_dt)
 
     if wandb_run is not None:
         wandb_run.finish()

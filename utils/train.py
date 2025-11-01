@@ -22,13 +22,16 @@ def kernel(x, y, sigma):
 
 
 def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_index, backprop, tag, sample, device='cpu',
-                      scheduler=None, scheduler_mode='none'):
+                      scheduler=None, scheduler_mode='none', integrator=None, integrator_dt=1.0, integrator_kwargs=None):
     if backprop:
         model.train()
     else:
         model.eval()
 
-    result = {'loss': 0., 'counter': 0., 'pos_err': 0.}
+    if integrator_kwargs is None:
+        integrator_kwargs = {}
+
+    result = {'loss': 0., 'counter': 0., 'pos_err': 0., 'pos_mae': 0.}
     for batch_index, data in enumerate(loader):
         # All to device
         data = data.to(device)
@@ -60,7 +63,28 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
             out = model(x=loc_0, h=node_feat, edge_index=edge_index, edge_fea=edge_attr, v=vel_0)
             loc_predict = out[0]
         elif model.__class__.__name__ == 'HEGNN':
-            loc_predict = model(node_feat, loc_0, vel_0, edge_index, edge_attr)
+            integrator_name = str(integrator).lower() if integrator is not None else None
+            use_integrator = (
+                integrator_name not in (None, 'none')
+                and hasattr(model, 'symplectic_euler_step')
+                and callable(getattr(model, 'symplectic_euler_step'))
+            )
+            if use_integrator:
+                masses = getattr(data, 'masses', None)
+                integrator_kwargs_local = dict(integrator_kwargs)
+                if integrator_name == 'symplectic_euler':
+                    pos_next, vel_next, accel = model.symplectic_euler_step(
+                        node_feat, loc_0, vel_0, edge_index, edge_attr, masses=masses, dt=integrator_dt, **integrator_kwargs_local
+                    )
+                elif integrator_name in ('velocity_verlet', 'verlet'):
+                    pos_next, vel_next, accel = model.velocity_verlet_step(
+                        node_feat, loc_0, vel_0, edge_index, edge_attr, masses=masses, dt=integrator_dt, **integrator_kwargs_local
+                    )
+                else:
+                    raise ValueError(f"Unknown integrator '{integrator}'.")
+                loc_predict = pos_next
+            else:
+                loc_predict = model(node_feat, loc_0, vel_0, edge_index, edge_attr)
         elif model.__class__.__name__ == 'GNN':
             nodes = torch.cat([loc_0, vel_0], dim=1)
             loc_predict = model(h=nodes, edge_index=edge_index, edge_fea=edge_attr)
@@ -101,6 +125,7 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
             err = (loc_predict - loc_t_detached).detach()
             err_l2 = torch.linalg.norm(err, dim=1)
             target_norm = torch.linalg.norm(loc_t_detached, dim=1)
+            mae = err.abs().mean().item()
             rms = torch.sqrt(torch.mean(loc_t_detached.pow(2)))
             floor = torch.maximum(
                 rms,
@@ -117,6 +142,7 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
         result['loss'] += loss_loc.item() * batch_size
         result['counter'] += batch_size
         result['pos_err'] += pct_err * batch_size
+        result['pos_mae'] += mae * batch_size
         
         if backprop:
             loss_loc.backward()
@@ -135,20 +161,22 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
 
     if result['counter'] == 0:
         print(f'{prefix + tag} epoch: {epoch_index}, no batches processed (batch_size too large?).')
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
     avg_loss = result["loss"] / result["counter"]
     avg_pos_err = result["pos_err"] / result["counter"]
-    print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}')
+    avg_pos_mae = result["pos_mae"] / result["counter"]
+    print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}, avg pos MAE: {avg_pos_mae :.6f}')
 
-    return avg_loss, avg_pos_err
+    return avg_loss, avg_pos_err, avg_pos_mae
 
 def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma, weight, log_directory, log_name,
           early_stop=float('inf'), device='cpu', test_interval=5, sample=3, config=None, wandb_run=None,
-          scheduler=None, scheduler_mode='none'):
-    log_dict = {'epochs': [], 'loss': [], 'loss_train': [], 'pos_err': [], 'pos_err_train': []}
+          scheduler=None, scheduler_mode='none', integrator=None, integrator_dt=1.0, integrator_kwargs=None):
+    log_dict = {'epochs': [], 'loss': [], 'loss_train': [], 'pos_err': [], 'pos_err_train': [], 'pos_mae': [], 'pos_mae_train': []}
     best_log_dict = {'epoch_index': 0, 'loss_valid': 1e8, 'loss_test': 1e8, 'loss_train': 1e8,
-                     'pos_err_valid': 1e8, 'pos_err_test': 1e8, 'pos_err_train': 1e8}
+                     'pos_err_valid': 1e8, 'pos_err_test': 1e8, 'pos_err_train': 1e8,
+                     'pos_mae_valid': 1e8, 'pos_mae_test': 1e8, 'pos_mae_train': 1e8}
 
     start =time.perf_counter()
     max_epochs = 2500
@@ -158,44 +186,52 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
     except Exception:
         max_epochs = 2500
     for epoch_index in range(1, max_epochs+1):
-        loss_train, pos_err_train = train_single_epoch(
+        loss_train, pos_err_train, pos_mae_train = train_single_epoch(
             model, loader_train, optimizer, loss, sigma, weight, epoch_index,
             backprop=True, tag='train', device=device, sample=sample,
-            scheduler=scheduler, scheduler_mode=scheduler_mode
+            scheduler=scheduler, scheduler_mode=scheduler_mode,
+            integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs
         )
         log_dict['loss_train'].append(loss_train)
         log_dict['pos_err_train'].append(pos_err_train)
+        log_dict['pos_mae_train'].append(pos_mae_train)
         if wandb_run is not None:
             wandb_run.log({
                 'epoch': epoch_index,
                 'train/step': epoch_index,
                 'train/loss': loss_train,
                 'train/pos_perc_error': pos_err_train,
+                'train/pos_mae': pos_mae_train,
                 'lr': optimizer.param_groups[0]['lr']
             }, step=epoch_index)
 
         if epoch_index % test_interval == 0:
-            loss_valid, pos_err_valid = train_single_epoch(
+            loss_valid, pos_err_valid, pos_mae_valid = train_single_epoch(
                 model, loader_valid, optimizer, loss, sigma, weight, epoch_index,
-                backprop=False, tag='valid', device=device, sample=sample
+                backprop=False, tag='valid', device=device, sample=sample,
+                integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs
             )
-            loss_test, pos_err_test = train_single_epoch(
+            loss_test, pos_err_test, pos_mae_test = train_single_epoch(
                 model, loader_test, optimizer, loss, sigma, weight, epoch_index,
-                backprop=False, tag='test', device=device, sample=sample
+                backprop=False, tag='test', device=device, sample=sample,
+                integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs
             )
             
             log_dict['epochs'].append(epoch_index)
             log_dict['loss'].append(loss_test)
             log_dict['pos_err'].append(pos_err_test)
+            log_dict['pos_mae'].append(pos_mae_test)
             if wandb_run is not None:
                 wandb_run.log({
                     'epoch': epoch_index,
                     'valid/step': epoch_index,
                     'valid/loss': loss_valid,
                     'valid/pos_perc_error': pos_err_valid,
+                    'valid/pos_mae': pos_mae_valid,
                     'test/step': epoch_index,
                     'test/loss': loss_test,
                     'test/pos_perc_error': pos_err_test,
+                    'test/pos_mae': pos_mae_test,
                     'lr': optimizer.param_groups[0]['lr']
                 }, step=epoch_index)
 
@@ -213,7 +249,10 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                                  'loss_train': loss_train,
                                  'pos_err_valid': pos_err_valid,
                                  'pos_err_test': pos_err_test,
-                                 'pos_err_train': pos_err_train}
+                                 'pos_err_train': pos_err_train,
+                                 'pos_mae_valid': pos_mae_valid,
+                                 'pos_mae_test': pos_mae_test,
+                                 'pos_mae_train': pos_mae_train}
                 name = None
                 if config.dataset_name in ['5_0_0', '20_0_0', '50_0_0', '100_0_0']:
                     name = 'nbody'

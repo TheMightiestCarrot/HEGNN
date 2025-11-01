@@ -9,3 +9,4 @@ scipy>=1.13,<1.17
 sympy==1.12
 torch_geometric==2.6.1
 tqdm==4.66.2
+matplotlib>=3.8,<3.9
