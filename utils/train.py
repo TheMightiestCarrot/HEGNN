@@ -9,12 +9,13 @@ METRIC_TARGET_FLOOR = 1e-3
 
 
 def _normalize_epoch_metrics(epoch_output):
-    """Support both legacy triple outputs and extended 6-tuple metrics."""
+    """Support both legacy triple outputs and extended metric tuples."""
     if isinstance(epoch_output, dict):
         required = (
             epoch_output.get('loss'),
             epoch_output.get('pos_err'),
             epoch_output.get('pos_mae'),
+            epoch_output.get('vel_pct_err', 0.0),
             epoch_output.get('vel_mae', 0.0),
             epoch_output.get('vel_rmse', 0.0),
             epoch_output.get('vel_loss', 0.0),
@@ -22,13 +23,16 @@ def _normalize_epoch_metrics(epoch_output):
         if required[0] is not None and required[1] is not None and required[2] is not None:
             return required
     elif isinstance(epoch_output, (list, tuple)):
-        if len(epoch_output) == 6:
+        if len(epoch_output) == 7:
             return epoch_output
+        if len(epoch_output) == 6:
+            loss, pos_err, pos_mae, vel_mae, vel_rmse, vel_loss = epoch_output
+            return loss, pos_err, pos_mae, 0.0, vel_mae, vel_rmse, vel_loss
         if len(epoch_output) == 3:
             loss, pos_err, pos_mae = epoch_output
-            return loss, pos_err, pos_mae, 0.0, 0.0, 0.0
+            return loss, pos_err, pos_mae, 0.0, 0.0, 0.0, 0.0
     raise ValueError(
-        "train_single_epoch returned unsupported metrics format; expected tuple of length 3 or 6, "
+        "train_single_epoch returned unsupported metrics format; expected tuple of length 3, 6, or 7, "
         f"got type {type(epoch_output)!r}."
     )
 
@@ -62,6 +66,7 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
         'counter': 0.,
         'pos_err': 0.,
         'pos_mae': 0.,
+        'vel_pct_err': 0.,
         'vel_mae': 0.,
         'vel_rmse': 0.,
         'vel_loss': 0.,
@@ -189,8 +194,22 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
                 vel_err = (vel_predict - vel_t_detached).detach()
                 vel_mae = vel_err.abs().mean().item()
                 vel_rmse = torch.sqrt(torch.mean(vel_err.pow(2))).item()
+                vel_err_l2 = torch.linalg.norm(vel_err, dim=1)
+                vel_target_norm = torch.linalg.norm(vel_t_detached, dim=1)
+                vel_rms = torch.sqrt(torch.mean(vel_t_detached.pow(2)))
+                vel_floor = torch.maximum(
+                    vel_rms,
+                    torch.tensor(
+                        METRIC_TARGET_FLOOR,
+                        device=vel_target_norm.device,
+                        dtype=vel_target_norm.dtype,
+                    ),
+                )
+                vel_denom = torch.clamp(vel_target_norm, min=vel_floor)
+                vel_pct_err = (vel_err_l2 / vel_denom).mean().item() * 100.0
             result['vel_mae'] += vel_mae * batch_size
             result['vel_rmse'] += vel_rmse * batch_size
+            result['vel_pct_err'] += vel_pct_err * batch_size
             result['vel_counter'] += batch_size
             result['vel_loss'] += loss_vel_value.item() * batch_size
 
@@ -224,17 +243,19 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
     avg_pos_mae = result["pos_mae"] / result["counter"]
 
     if result['vel_counter'] > 0:
+        avg_vel_pct_err = result['vel_pct_err'] / result['vel_counter']
         avg_vel_mae = result['vel_mae'] / result['vel_counter']
         avg_vel_rmse = result['vel_rmse'] / result['vel_counter']
         avg_vel_loss = result['vel_loss'] / result['vel_counter']
-        print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}, avg pos MAE: {avg_pos_mae :.6f}, avg vel MAE: {avg_vel_mae :.6f}, avg vel RMSE: {avg_vel_rmse :.6f}')
+        print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}, avg pos MAE: {avg_pos_mae :.6f}, avg vel %err: {avg_vel_pct_err :.4f}, avg vel MAE: {avg_vel_mae :.6f}, avg vel RMSE: {avg_vel_rmse :.6f}')
     else:
+        avg_vel_pct_err = 0.0
         avg_vel_mae = 0.0
         avg_vel_rmse = 0.0
         avg_vel_loss = 0.0
         print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}, avg pos MAE: {avg_pos_mae :.6f}')
 
-    return avg_loss, avg_pos_err, avg_pos_mae, avg_vel_mae, avg_vel_rmse, avg_vel_loss
+    return avg_loss, avg_pos_err, avg_pos_mae, avg_vel_pct_err, avg_vel_mae, avg_vel_rmse, avg_vel_loss
 
 def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma, weight, log_directory, log_name,
           early_stop=float('inf'), device='cpu', test_interval=5, sample=3, config=None, wandb_run=None,
@@ -248,6 +269,8 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
         'pos_err_train': [],
         'pos_mae': [],
         'pos_mae_train': [],
+        'vel_pct_err': [],
+        'vel_pct_err_train': [],
         'vel_mae': [],
         'vel_mae_train': [],
         'vel_rmse': [],
@@ -266,6 +289,9 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
         'pos_mae_valid': 1e8,
         'pos_mae_test': 1e8,
         'pos_mae_train': 1e8,
+        'vel_pct_err_valid': 1e8,
+        'vel_pct_err_test': 1e8,
+        'vel_pct_err_train': 1e8,
         'vel_mae_valid': 1e8,
         'vel_mae_test': 1e8,
         'vel_mae_train': 1e8,
@@ -296,6 +322,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
             loss_train,
             pos_err_train,
             pos_mae_train,
+            vel_pct_err_train,
             vel_mae_train,
             vel_rmse_train,
             vel_loss_train,
@@ -303,6 +330,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
         log_dict['loss_train'].append(loss_train)
         log_dict['pos_err_train'].append(pos_err_train)
         log_dict['pos_mae_train'].append(pos_mae_train)
+        log_dict['vel_pct_err_train'].append(vel_pct_err_train)
         log_dict['vel_mae_train'].append(vel_mae_train)
         log_dict['vel_rmse_train'].append(vel_rmse_train)
         log_dict['vel_loss_train'].append(vel_loss_train)
@@ -313,6 +341,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                 'train/loss': loss_train,
                 'train/pos_perc_error': pos_err_train,
                 'train/pos_mae': pos_mae_train,
+                'train/vel_perc_error': vel_pct_err_train,
                 'train/vel_mae': vel_mae_train,
                 'train/vel_rmse': vel_rmse_train,
                 'train/vel_loss': vel_loss_train,
@@ -330,6 +359,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                 loss_valid,
                 pos_err_valid,
                 pos_mae_valid,
+                vel_pct_err_valid,
                 vel_mae_valid,
                 vel_rmse_valid,
                 vel_loss_valid,
@@ -344,6 +374,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                 loss_test,
                 pos_err_test,
                 pos_mae_test,
+                vel_pct_err_test,
                 vel_mae_test,
                 vel_rmse_test,
                 vel_loss_test,
@@ -353,6 +384,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
             log_dict['loss'].append(loss_test)
             log_dict['pos_err'].append(pos_err_test)
             log_dict['pos_mae'].append(pos_mae_test)
+            log_dict['vel_pct_err'].append(vel_pct_err_test)
             log_dict['vel_mae'].append(vel_mae_test)
             log_dict['vel_rmse'].append(vel_rmse_test)
             log_dict['vel_loss'].append(vel_loss_test)
@@ -363,6 +395,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                     'valid/loss': loss_valid,
                     'valid/pos_perc_error': pos_err_valid,
                     'valid/pos_mae': pos_mae_valid,
+                    'valid/vel_perc_error': vel_pct_err_valid,
                     'valid/vel_mae': vel_mae_valid,
                     'valid/vel_rmse': vel_rmse_valid,
                     'valid/vel_loss': vel_loss_valid,
@@ -370,6 +403,7 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                     'test/loss': loss_test,
                     'test/pos_perc_error': pos_err_test,
                     'test/pos_mae': pos_mae_test,
+                    'test/vel_perc_error': vel_pct_err_test,
                     'test/vel_mae': vel_mae_test,
                     'test/vel_rmse': vel_rmse_test,
                     'test/vel_loss': vel_loss_test,
@@ -395,6 +429,9 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                     'pos_mae_valid': pos_mae_valid,
                     'pos_mae_test': pos_mae_test,
                     'pos_mae_train': pos_mae_train,
+                    'vel_pct_err_valid': vel_pct_err_valid,
+                    'vel_pct_err_test': vel_pct_err_test,
+                    'vel_pct_err_train': vel_pct_err_train,
                     'vel_mae_valid': vel_mae_valid,
                     'vel_mae_test': vel_mae_test,
                     'vel_mae_train': vel_mae_train,
