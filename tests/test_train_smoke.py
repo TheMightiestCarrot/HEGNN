@@ -51,7 +51,7 @@ def test_train_single_epoch_smoke(synthetic_nbody_dir):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     loss_fn = nn.MSELoss()
 
-    avg_loss, pos_err, pos_mae = train_single_epoch(
+    avg_loss, pos_err, pos_mae, vel_mae, vel_rmse, vel_loss = train_single_epoch(
         model=model,
         loader=loader,
         optimizer=optimizer,
@@ -65,6 +65,9 @@ def test_train_single_epoch_smoke(synthetic_nbody_dir):
         device="cpu",
     )
 
-    metrics = torch.tensor([avg_loss, pos_err, pos_mae], dtype=torch.float32)
+    metrics = torch.tensor(
+        [avg_loss, pos_err, pos_mae, vel_mae, vel_rmse, vel_loss],
+        dtype=torch.float32,
+    )
     assert torch.isfinite(metrics).all()
     assert avg_loss >= 0.0

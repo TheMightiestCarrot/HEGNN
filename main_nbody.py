@@ -75,6 +75,20 @@ parser.add_argument('--coarse_dt', type=float, default=1.0,
                     help='coarse timestep ΔT for the integrator (default: 1.0)')
 parser.add_argument('--use_velocity_features', type=str2bool, nargs='?', const=True, default=False,
                     help='set True to feed symmetric velocity invariants into HEGNN_acceleration force head (default: False)')
+parser.add_argument('--loss_vel_weight', type=float, default=0.0,
+                    help='weight applied to velocity supervision term (default: 0.0)')
+parser.add_argument('--auto_tune_hparams', action='store_true',
+                    help='estimate coarse_dt and loss_vel_weight from dataset statistics before training')
+parser.add_argument('--tune_partitions', type=str, default='train',
+                    help='comma-separated partitions to use for auto tuning (default: train)')
+parser.add_argument('--tune_max_samples', type=int, default=1000,
+                    help='maximum samples to load per partition during auto tuning (default: 1000)')
+parser.add_argument('--tune_report_path', type=str, default=None,
+                    help='optional path to store the auto-tuning report as JSON')
+parser.add_argument('--tune_apply_coarse_dt', type=str2bool, nargs='?', const=True, default=True,
+                    help='apply the tuned coarse_dt value (default: True)')
+parser.add_argument('--tune_apply_loss_vel', type=str2bool, nargs='?', const=True, default=True,
+                    help='apply the tuned velocity-loss weight (default: True)')
 
 # Scheduler
 parser.add_argument('--scheduler', type=str, default='none',
@@ -120,6 +134,38 @@ parser.add_argument('--device', type=str, default='cpu', help='device (default: 
 
 args=parser.parse_args()
 # print(args)
+
+if args.auto_tune_hparams:
+    from utils.hyperparam_tuning import auto_tune_coarse_dt_and_weight, save_tuning_report
+
+    partitions = [p.strip() for p in args.tune_partitions.split(',') if p.strip()]
+    if not partitions:
+        partitions = ['train']
+
+    tuning_report = auto_tune_coarse_dt_and_weight(
+        data_dir=args.data_directory,
+        dataset_name=args.dataset_name,
+        frame_0=30,
+        frame_T=40,
+        partitions=partitions,
+        max_samples=None if args.tune_max_samples is None or args.tune_max_samples < 0 else args.tune_max_samples,
+    )
+    print('[auto-tune] report:', tuning_report)
+
+    tuned_dt = tuning_report.get('suggested_coarse_dt', args.coarse_dt)
+    tuned_loss_weight = tuning_report.get('suggested_loss_vel_weight', args.loss_vel_weight)
+
+    if args.tune_apply_coarse_dt:
+        print(f'[auto-tune] coarse_dt: {args.coarse_dt} -> {tuned_dt}')
+        args.coarse_dt = float(tuned_dt)
+    if args.tune_apply_loss_vel:
+        print(f'[auto-tune] loss_vel_weight: {args.loss_vel_weight} -> {tuned_loss_weight}')
+        args.loss_vel_weight = float(tuned_loss_weight)
+
+    if args.tune_report_path:
+        save_tuning_report(tuning_report, args.tune_report_path)
+
+    setattr(args, 'auto_tune_report', tuning_report)
 
 
 def get_velocity_attr(loc, vel, rows, cols):
@@ -256,11 +302,29 @@ if __name__ == '__main__':
 
     integrator_choice = None if args.integrator == 'none' else args.integrator
 
-    best_log_dict, log_dict = train(model, loader_train, loader_valid, loader_test, optimizer, loss_mse, sigma=args.sigma,
-                                    weight=args.weight, device=args.device, test_interval=args.test_interval, config=args,
-                                    log_directory=log_directory, log_name=log_name, early_stop=args.early_stop, sample=args.sample,
-                                    wandb_run=wandb_run, scheduler=scheduler, scheduler_mode=scheduler_mode,
-                                    integrator=integrator_choice, integrator_dt=args.coarse_dt)
+    best_log_dict, log_dict = train(
+        model,
+        loader_train,
+        loader_valid,
+        loader_test,
+        optimizer,
+        loss_mse,
+        sigma=args.sigma,
+        weight=args.weight,
+        device=args.device,
+        test_interval=args.test_interval,
+        config=args,
+        log_directory=log_directory,
+        log_name=log_name,
+        early_stop=args.early_stop,
+        sample=args.sample,
+        wandb_run=wandb_run,
+        scheduler=scheduler,
+        scheduler_mode=scheduler_mode,
+        integrator=integrator_choice,
+        integrator_dt=args.coarse_dt,
+        loss_vel_weight=args.loss_vel_weight,
+    )
 
     if wandb_run is not None:
         wandb_run.finish()

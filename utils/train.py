@@ -7,6 +7,31 @@ import torch
 
 METRIC_TARGET_FLOOR = 1e-3
 
+
+def _normalize_epoch_metrics(epoch_output):
+    """Support both legacy triple outputs and extended 6-tuple metrics."""
+    if isinstance(epoch_output, dict):
+        required = (
+            epoch_output.get('loss'),
+            epoch_output.get('pos_err'),
+            epoch_output.get('pos_mae'),
+            epoch_output.get('vel_mae', 0.0),
+            epoch_output.get('vel_rmse', 0.0),
+            epoch_output.get('vel_loss', 0.0),
+        )
+        if required[0] is not None and required[1] is not None and required[2] is not None:
+            return required
+    elif isinstance(epoch_output, (list, tuple)):
+        if len(epoch_output) == 6:
+            return epoch_output
+        if len(epoch_output) == 3:
+            loss, pos_err, pos_mae = epoch_output
+            return loss, pos_err, pos_mae, 0.0, 0.0, 0.0
+    raise ValueError(
+        "train_single_epoch returned unsupported metrics format; expected tuple of length 3 or 6, "
+        f"got type {type(epoch_output)!r}."
+    )
+
 def get_edges_in_mini_batch(batch_size, num_nodes_all, edge_index):
     correction_for_batch = num_nodes_all * torch.arange(batch_size, device=edge_index.device)  # [batch_size]
     correction_for_batch = correction_for_batch.repeat_interleave(edge_index.size(1) // batch_size, dim=0).unsqueeze(0)  # [1, edge_cnt]
@@ -22,7 +47,8 @@ def kernel(x, y, sigma):
 
 
 def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_index, backprop, tag, sample, device='cpu',
-                      scheduler=None, scheduler_mode='none', integrator=None, integrator_dt=1.0, integrator_kwargs=None):
+                      scheduler=None, scheduler_mode='none', integrator=None, integrator_dt=1.0, integrator_kwargs=None,
+                      loss_vel_weight=0.0):
     if backprop:
         model.train()
     else:
@@ -31,7 +57,16 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
     if integrator_kwargs is None:
         integrator_kwargs = {}
 
-    result = {'loss': 0., 'counter': 0., 'pos_err': 0., 'pos_mae': 0.}
+    result = {
+        'loss': 0.,
+        'counter': 0.,
+        'pos_err': 0.,
+        'pos_mae': 0.,
+        'vel_mae': 0.,
+        'vel_rmse': 0.,
+        'vel_loss': 0.,
+        'vel_counter': 0.,
+    }
     for batch_index, data in enumerate(loader):
         # All to device
         data = data.to(device)
@@ -41,6 +76,7 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
         batch_size = data['ptr'].size(0) - 1
         edge_index, edge_attr = data['edge_index'], data['edge_attr']
         loc_0, vel_0, loc_t = data['loc_0'], data['vel_0'], data['loc_t']
+        vel_t = getattr(data, 'vel_t', None)
         node_feat, node_attr = data['node_feat'], data['node_attr']
 
         row, col = edge_index
@@ -50,10 +86,13 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
         # detach from compute graph
         loc_0, vel_0, node_attr, node_feat = loc_0.detach(), vel_0.detach(), node_attr.detach(), node_feat.detach()
         edge_attr, edge_index = edge_attr.detach(), edge_index.detach()
+        if vel_t is not None:
+            vel_t = vel_t.detach()
 
         optimizer.zero_grad()
 
         # start_time = time.time()
+        vel_predict = None
         if model.__class__.__name__ == 'TFNModel':
             loc_predict = model(loc=loc_0, h=node_feat, vel=vel_0, edge_index=edge_index, data_batch=data['batch'])
         elif model.__class__.__name__ == 'VNEGNN':
@@ -83,6 +122,7 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
                 else:
                     raise ValueError(f"Unknown integrator '{integrator}'.")
                 loc_predict = pos_next
+                vel_predict = vel_next
             else:
                 loc_predict = model(node_feat, loc_0, vel_0, edge_index, edge_attr)
         elif model.__class__.__name__ == 'GNN':
@@ -119,7 +159,8 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
             print(model.__class__.__name__)
             raise Exception('Wrong model')
         
-        loss_loc = loss(loc_predict, loc_t)
+        loss_pos = loss(loc_predict, loc_t)
+        total_loss = loss_pos
         with torch.no_grad():
             loc_t_detached = loc_t.detach()
             err = (loc_predict - loc_t_detached).detach()
@@ -138,14 +179,29 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
             denom = torch.clamp(target_norm, min=floor)
             pct_err = (err_l2 / denom).mean().item() * 100.0
 
+        loss_vel_value = None
+        if vel_predict is not None and vel_t is not None:
+            loss_vel_value = loss(vel_predict, vel_t)
+            if loss_vel_weight > 0.0:
+                total_loss = total_loss + loss_vel_weight * loss_vel_value
+            with torch.no_grad():
+                vel_t_detached = vel_t.detach()
+                vel_err = (vel_predict - vel_t_detached).detach()
+                vel_mae = vel_err.abs().mean().item()
+                vel_rmse = torch.sqrt(torch.mean(vel_err.pow(2))).item()
+            result['vel_mae'] += vel_mae * batch_size
+            result['vel_rmse'] += vel_rmse * batch_size
+            result['vel_counter'] += batch_size
+            result['vel_loss'] += loss_vel_value.item() * batch_size
+
         # record the loss
-        result['loss'] += loss_loc.item() * batch_size
+        result['loss'] += total_loss.item() * batch_size
         result['counter'] += batch_size
         result['pos_err'] += pct_err * batch_size
         result['pos_mae'] += mae * batch_size
         
         if backprop:
-            loss_loc.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
             optimizer.step()
             if scheduler is not None and scheduler_mode == 'batch':
@@ -161,22 +217,65 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
 
     if result['counter'] == 0:
         print(f'{prefix + tag} epoch: {epoch_index}, no batches processed (batch_size too large?).')
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     avg_loss = result["loss"] / result["counter"]
     avg_pos_err = result["pos_err"] / result["counter"]
     avg_pos_mae = result["pos_mae"] / result["counter"]
-    print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}, avg pos MAE: {avg_pos_mae :.6f}')
 
-    return avg_loss, avg_pos_err, avg_pos_mae
+    if result['vel_counter'] > 0:
+        avg_vel_mae = result['vel_mae'] / result['vel_counter']
+        avg_vel_rmse = result['vel_rmse'] / result['vel_counter']
+        avg_vel_loss = result['vel_loss'] / result['vel_counter']
+        print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}, avg pos MAE: {avg_pos_mae :.6f}, avg vel MAE: {avg_vel_mae :.6f}, avg vel RMSE: {avg_vel_rmse :.6f}')
+    else:
+        avg_vel_mae = 0.0
+        avg_vel_rmse = 0.0
+        avg_vel_loss = 0.0
+        print(f'{prefix + tag} epoch: {epoch_index}, avg loss: {avg_loss :.5f}, avg pos %err: {avg_pos_err :.4f}, avg pos MAE: {avg_pos_mae :.6f}')
+
+    return avg_loss, avg_pos_err, avg_pos_mae, avg_vel_mae, avg_vel_rmse, avg_vel_loss
 
 def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma, weight, log_directory, log_name,
           early_stop=float('inf'), device='cpu', test_interval=5, sample=3, config=None, wandb_run=None,
-          scheduler=None, scheduler_mode='none', integrator=None, integrator_dt=1.0, integrator_kwargs=None):
-    log_dict = {'epochs': [], 'loss': [], 'loss_train': [], 'pos_err': [], 'pos_err_train': [], 'pos_mae': [], 'pos_mae_train': []}
-    best_log_dict = {'epoch_index': 0, 'loss_valid': 1e8, 'loss_test': 1e8, 'loss_train': 1e8,
-                     'pos_err_valid': 1e8, 'pos_err_test': 1e8, 'pos_err_train': 1e8,
-                     'pos_mae_valid': 1e8, 'pos_mae_test': 1e8, 'pos_mae_train': 1e8}
+          scheduler=None, scheduler_mode='none', integrator=None, integrator_dt=1.0, integrator_kwargs=None,
+          loss_vel_weight=0.0):
+    log_dict = {
+        'epochs': [],
+        'loss': [],
+        'loss_train': [],
+        'pos_err': [],
+        'pos_err_train': [],
+        'pos_mae': [],
+        'pos_mae_train': [],
+        'vel_mae': [],
+        'vel_mae_train': [],
+        'vel_rmse': [],
+        'vel_rmse_train': [],
+        'vel_loss': [],
+        'vel_loss_train': [],
+    }
+    best_log_dict = {
+        'epoch_index': 0,
+        'loss_valid': 1e8,
+        'loss_test': 1e8,
+        'loss_train': 1e8,
+        'pos_err_valid': 1e8,
+        'pos_err_test': 1e8,
+        'pos_err_train': 1e8,
+        'pos_mae_valid': 1e8,
+        'pos_mae_test': 1e8,
+        'pos_mae_train': 1e8,
+        'vel_mae_valid': 1e8,
+        'vel_mae_test': 1e8,
+        'vel_mae_train': 1e8,
+        'vel_rmse_valid': 1e8,
+        'vel_rmse_test': 1e8,
+        'vel_rmse_train': 1e8,
+        'vel_loss_valid': 1e8,
+        'vel_loss_test': 1e8,
+        'vel_loss_train': 1e8,
+    }
 
     start =time.perf_counter()
     max_epochs = 2500
@@ -186,15 +285,27 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
     except Exception:
         max_epochs = 2500
     for epoch_index in range(1, max_epochs+1):
-        loss_train, pos_err_train, pos_mae_train = train_single_epoch(
+        train_epoch_output = train_single_epoch(
             model, loader_train, optimizer, loss, sigma, weight, epoch_index,
             backprop=True, tag='train', device=device, sample=sample,
             scheduler=scheduler, scheduler_mode=scheduler_mode,
-            integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs
+            integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs,
+            loss_vel_weight=loss_vel_weight,
         )
+        (
+            loss_train,
+            pos_err_train,
+            pos_mae_train,
+            vel_mae_train,
+            vel_rmse_train,
+            vel_loss_train,
+        ) = _normalize_epoch_metrics(train_epoch_output)
         log_dict['loss_train'].append(loss_train)
         log_dict['pos_err_train'].append(pos_err_train)
         log_dict['pos_mae_train'].append(pos_mae_train)
+        log_dict['vel_mae_train'].append(vel_mae_train)
+        log_dict['vel_rmse_train'].append(vel_rmse_train)
+        log_dict['vel_loss_train'].append(vel_loss_train)
         if wandb_run is not None:
             wandb_run.log({
                 'epoch': epoch_index,
@@ -202,25 +313,49 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                 'train/loss': loss_train,
                 'train/pos_perc_error': pos_err_train,
                 'train/pos_mae': pos_mae_train,
+                'train/vel_mae': vel_mae_train,
+                'train/vel_rmse': vel_rmse_train,
+                'train/vel_loss': vel_loss_train,
                 'lr': optimizer.param_groups[0]['lr']
             }, step=epoch_index)
 
         if epoch_index % test_interval == 0:
-            loss_valid, pos_err_valid, pos_mae_valid = train_single_epoch(
+            valid_epoch_output = train_single_epoch(
                 model, loader_valid, optimizer, loss, sigma, weight, epoch_index,
                 backprop=False, tag='valid', device=device, sample=sample,
-                integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs
+                integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs,
+                loss_vel_weight=loss_vel_weight,
             )
-            loss_test, pos_err_test, pos_mae_test = train_single_epoch(
+            (
+                loss_valid,
+                pos_err_valid,
+                pos_mae_valid,
+                vel_mae_valid,
+                vel_rmse_valid,
+                vel_loss_valid,
+            ) = _normalize_epoch_metrics(valid_epoch_output)
+            test_epoch_output = train_single_epoch(
                 model, loader_test, optimizer, loss, sigma, weight, epoch_index,
                 backprop=False, tag='test', device=device, sample=sample,
-                integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs
+                integrator=integrator, integrator_dt=integrator_dt, integrator_kwargs=integrator_kwargs,
+                loss_vel_weight=loss_vel_weight,
             )
+            (
+                loss_test,
+                pos_err_test,
+                pos_mae_test,
+                vel_mae_test,
+                vel_rmse_test,
+                vel_loss_test,
+            ) = _normalize_epoch_metrics(test_epoch_output)
             
             log_dict['epochs'].append(epoch_index)
             log_dict['loss'].append(loss_test)
             log_dict['pos_err'].append(pos_err_test)
             log_dict['pos_mae'].append(pos_mae_test)
+            log_dict['vel_mae'].append(vel_mae_test)
+            log_dict['vel_rmse'].append(vel_rmse_test)
+            log_dict['vel_loss'].append(vel_loss_test)
             if wandb_run is not None:
                 wandb_run.log({
                     'epoch': epoch_index,
@@ -228,10 +363,16 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                     'valid/loss': loss_valid,
                     'valid/pos_perc_error': pos_err_valid,
                     'valid/pos_mae': pos_mae_valid,
+                    'valid/vel_mae': vel_mae_valid,
+                    'valid/vel_rmse': vel_rmse_valid,
+                    'valid/vel_loss': vel_loss_valid,
                     'test/step': epoch_index,
                     'test/loss': loss_test,
                     'test/pos_perc_error': pos_err_test,
                     'test/pos_mae': pos_mae_test,
+                    'test/vel_mae': vel_mae_test,
+                    'test/vel_rmse': vel_rmse_test,
+                    'test/vel_loss': vel_loss_test,
                     'lr': optimizer.param_groups[0]['lr']
                 }, step=epoch_index)
 
@@ -243,16 +384,27 @@ def train(model, loader_train, loader_valid, loader_test, optimizer, loss, sigma
                     print(f'[warn] plateau scheduler.step(loss) failed: {e}')
             
             if loss_valid < best_log_dict['loss_valid']:
-                best_log_dict = {'epoch_index': epoch_index,
-                                 'loss_valid': loss_valid,
-                                 'loss_test': loss_test,
-                                 'loss_train': loss_train,
-                                 'pos_err_valid': pos_err_valid,
-                                 'pos_err_test': pos_err_test,
-                                 'pos_err_train': pos_err_train,
-                                 'pos_mae_valid': pos_mae_valid,
-                                 'pos_mae_test': pos_mae_test,
-                                 'pos_mae_train': pos_mae_train}
+                best_log_dict = {
+                    'epoch_index': epoch_index,
+                    'loss_valid': loss_valid,
+                    'loss_test': loss_test,
+                    'loss_train': loss_train,
+                    'pos_err_valid': pos_err_valid,
+                    'pos_err_test': pos_err_test,
+                    'pos_err_train': pos_err_train,
+                    'pos_mae_valid': pos_mae_valid,
+                    'pos_mae_test': pos_mae_test,
+                    'pos_mae_train': pos_mae_train,
+                    'vel_mae_valid': vel_mae_valid,
+                    'vel_mae_test': vel_mae_test,
+                    'vel_mae_train': vel_mae_train,
+                    'vel_rmse_valid': vel_rmse_valid,
+                    'vel_rmse_test': vel_rmse_test,
+                    'vel_rmse_train': vel_rmse_train,
+                    'vel_loss_valid': vel_loss_valid,
+                    'vel_loss_test': vel_loss_test,
+                    'vel_loss_train': vel_loss_train,
+                }
                 name = None
                 if config.dataset_name in ['5_0_0', '20_0_0', '50_0_0', '100_0_0']:
                     name = 'nbody'

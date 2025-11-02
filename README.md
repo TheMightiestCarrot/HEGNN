@@ -48,6 +48,46 @@ python -u ./datasets/nbody/datagen/generate_dataset.py --num-train 5000 --seed 4
 python ./main_nbody.py --model HEGNN --ell 3 --data_directory <your_dir> --dataset_name "5_0_0"
 ```
 
+##### Optional: Velocity Targets & Auto-Tuned Hyperparameters
+
+- Enable velocity supervision by passing `--loss_vel_weight <λ>`; when `--integrator` predicts positions via symplectic Euler, this also supervises the implied velocity.
+- Use `--use_velocity_features True` when training `HEGNN_acceleration` to feed relative velocity invariants into the force head.
+- The helper `scripts/auto_tune_hparams.py` estimates a good coarse step `Δt` and loss weight from the dataset:
+
+  ```bash
+  python3 scripts/auto_tune_hparams.py \
+    --data_directory datasets/nbody/data_5body_full \
+    --dataset_name 5_0_0 \
+    --partitions train,valid \
+    --max_samples 1500 \
+    --output logs/nbody/tuning.json --pretty
+  ```
+
+- To run the estimator automatically before training, add `--auto_tune_hparams`. By default this:
+  - samples up to `--tune_max_samples` (default 1000) per partition listed in `--tune_partitions`,
+  - applies the suggested `--coarse_dt` and `--loss_vel_weight`,
+  - optionally writes the JSON report if `--tune_report_path` is provided.
+
+Example with auto tuning:
+
+```bash
+python -u ./main_nbody.py \
+  --model HEGNN_acceleration \
+  --ell 1 \
+  --dim_hidden 64 \
+  --num_layer 4 \
+  --data_directory datasets/nbody/data_5body_full \
+  --dataset_name 5_0_0 \
+  --device cuda \
+  --batch_size 256 \
+  --epochs 1000 \
+  --integrator symplectic_euler \
+  --auto_tune_hparams \
+  --tune_partitions train,valid \
+  --tune_report_path logs/nbody/tuning.json \
+  --use_velocity_features True
+```
+
 #### Visualise Trajectories
 
 Once the dataset is generated (or you use the bundled samples in `datasets/nbody/data_small`), you can inspect any simulated rollout and export an MP4 animation:

@@ -65,16 +65,28 @@ class NBodySystemDataset(Dataset):
         vel_0, vel_t = vel[:, self.frame_0, :, :], vel[:, self.frame_T, :, :]  # [num_systems, num_node_r, 3]
 
         num_systems, num_node_r, _ = charges.size()
-        loc_0, loc_t, vel_0, charges = loc_0.to(device), loc_t.to(device), vel_0.to(device), charges.to(device)
+        loc_0 = loc_0.to(device)
+        loc_t = loc_t.to(device)
+        vel_0 = vel_0.to(device)
+        vel_t = vel_t.to(device)
+        charges = charges.to(device)
 
         data = []
         for i in tqdm(range(num_systems)):
-            data.append(self.get_graph_step(loc_0[i, :, :], vel_0[i, :, :], charges[i, :, :], loc_t[i, :, :]).to('cpu'))
+            data.append(
+                self.get_graph_step(
+                    loc_0[i, :, :],
+                    vel_0[i, :, :],
+                    vel_t[i, :, :],
+                    charges[i, :, :],
+                    loc_t[i, :, :],
+                ).to('cpu')
+            )
 
         return data
     
 
-    def get_graph_step(self, loc_0, vel_0, charges, loc_t):
+    def get_graph_step(self, loc_0, vel_0, vel_t, charges, loc_t):
         rotate_matrix = random_rotate()
         rotate_matrix = rotate_matrix.to(loc_0.device).to(torch.float)
 
@@ -82,6 +94,7 @@ class NBodySystemDataset(Dataset):
             loc_0 = loc_0 @ rotate_matrix
             loc_t = loc_t @ rotate_matrix
             vel_0 = vel_0 @ rotate_matrix
+            vel_t = vel_t @ rotate_matrix
 
         # Edge
         edge_index = self.cutoff_edge(loc_0)
@@ -95,8 +108,17 @@ class NBodySystemDataset(Dataset):
         # Virtual node loc = mean
         loc_mean = torch.mean(loc_0, dim=0).unsqueeze(-1).repeat(1, self.virtual_channels).unsqueeze(0)  # [1, 3, C]
 
-        return Data(edge_index=edge_index, edge_attr=edge_attr, loc_0=loc_0, loc_t=loc_t, vel_0=vel_0, \
-                    node_feat=node_feat, node_attr=charges, loc_mean=loc_mean)
+        return Data(
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            loc_0=loc_0,
+            loc_t=loc_t,
+            vel_0=vel_0,
+            vel_t=vel_t,
+            node_feat=node_feat,
+            node_attr=charges,
+            loc_mean=loc_mean,
+        )
 
 
     def cutoff_edge(self, loc_0):
