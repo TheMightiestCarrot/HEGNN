@@ -160,6 +160,19 @@ def train_single_epoch(model, loader, optimizer, loss, sigma, weight, epoch_inde
         elif model.__class__.__name__ == 'SEGNN':
             x = torch.cat([node_feat, loc_0, vel_0], dim=1)
             loc_predict = model(x=x, pos=loc_0, edge_index=edge_index, edge_attr=edge_attr, node_attr=node_attr, batch=data['batch'])
+        elif model.__class__.__name__ == 'SEGNNFull':
+            scalar_attr = node_attr
+            outputs = model(
+                pos=loc_0,
+                vel=vel_0,
+                node_attr=scalar_attr,
+                edge_index=edge_index,
+                batch=data['batch'],
+            )
+            delta_pos = outputs[:, :3]
+            loc_predict = loc_0 + delta_pos
+            if loss_vel_weight > 0.0 and outputs.size(1) >= 6:
+                vel_predict = outputs[:, 3:6]
         else:
             print(model.__class__.__name__)
             raise Exception('Wrong model')

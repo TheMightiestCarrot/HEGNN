@@ -23,6 +23,7 @@ from models.Clof.clof import ClofNet, ClofNet_vel
 from models.mace.mace import MACEModel
 from models.segnn.segnn import SEGNN
 from models.segnn.balanced_irreps import WeightBalancedIrreps
+from models.segnn_full import SEGNNFull
 from datasets.nbody.dataset import NBodySystemDataset
 
 parser=argparse.ArgumentParser(description='HEGNN')
@@ -271,6 +272,26 @@ if __name__ == '__main__':
         print("hidden_irreps: ", hidden_irreps)
 
         model = SEGNN(input_irreps, hidden_irreps, output_irreps, edge_attr_irreps, node_attr_irreps, num_layers=args.num_layer, task="node", additional_message_irreps=additional_message_irreps, device=args.device)
+    elif args.model == 'SEGNN_FULL':
+        input_irreps = e3nn.o3.Irreps("2x1o + 1x0e")
+        output_vectors = 2 if args.loss_vel_weight > 0.0 else 1
+        output_irreps = e3nn.o3.Irreps(f"{output_vectors}x1o")
+        additional_message_irreps = e3nn.o3.Irreps("2x0e")
+
+        print("input_irreps: ", input_irreps)
+        model = SEGNNFull(
+            input_irreps=input_irreps,
+            hidden_features=args.dim_hidden,
+            lmax_h=args.ell,
+            lmax_attr=args.ell,
+            num_layers=args.num_layer,
+            output_irreps=output_irreps,
+            additional_message_irreps=additional_message_irreps,
+            norm="batch",
+            task="node",
+            use_force_input=False,
+            device=args.device,
+        )
     else:
         raise Exception('Wrong model')
     print(model)
